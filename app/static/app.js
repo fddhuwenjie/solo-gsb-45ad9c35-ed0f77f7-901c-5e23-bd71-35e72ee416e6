@@ -523,10 +523,15 @@ function renderSchedules() {
         .map(
           (s) => `
         <div class="sched-item${s.id === state.editingScheduleId ? " editing" : ""}">
-          <div class="title">窑次 #${s.load_id} · ${esc(s.load_name)}</div>
+          <div class="title">窑次 #${s.load_id} · ${esc(s.load_name)}
+            ${s.result_id ? `<span class="tag tag-confirmed">已登记实绩</span>` : ""}</div>
           <div class="meta">${fmtTime(s.start_at)} → ${fmtTime(s.end_at)}</div>
           <div class="meta">拟用峰温 ${s.peak_temp} °C · 保温 ${s.hold_minutes} 分钟</div>
-          <button data-edit-sched="${s.id}">修改</button>
+          ${s.result_id
+            ? `<button data-view-result="${s.id}">查看实绩</button>`
+            : `<button data-edit-sched="${s.id}">修改</button>
+               <button data-reg-result="${s.id}">登记实绩</button>`}
+          <div class="sched-detail hidden" id="sched-detail-${s.id}"></div>
         </div>`
         )
         .join("")}`
@@ -536,11 +541,21 @@ function renderSchedules() {
   box.querySelectorAll("[data-edit-sched]").forEach((btn) =>
     btn.addEventListener("click", () => startEditSchedule(Number(btn.dataset.editSched)))
   );
+  box.querySelectorAll("[data-reg-result]").forEach((btn) =>
+    btn.addEventListener("click", () => toggleResultForm(Number(btn.dataset.regResult)))
+  );
+  box.querySelectorAll("[data-view-result]").forEach((btn) =>
+    btn.addEventListener("click", () => toggleResultView(Number(btn.dataset.viewResult)))
+  );
 }
 
 function startEditSchedule(id) {
   const s = state.schedules.find((x) => x.id === id);
   if (!s) return;
+  if (s.result_id) {
+    toast("该安排已登记烧成实绩，不得再修改", "err");
+    return;
+  }
   state.editingScheduleId = id;
   renderLoadOptions();
   $("s-start").value = isoToLocalInput(s.start_at);
@@ -598,6 +613,108 @@ $("sched-form").addEventListener("submit", async (ev) => {
     await reloadSchedules();
   }
 });
+
+// ---------------- 烧成实绩登记 ----------------
+
+function closeSchedDetail(detail) {
+  detail.classList.add("hidden");
+  detail.innerHTML = "";
+}
+
+// 在安排卡片旁展开实绩登记表单
+function toggleResultForm(schedId) {
+  const detail = $(`sched-detail-${schedId}`);
+  if (!detail.classList.contains("hidden")) { closeSchedDetail(detail); return; }
+  const s = state.schedules.find((x) => x.id === schedId);
+  if (!s) return;
+  detail.innerHTML = `
+    <div class="meta">将按当前读取的安排登记：${fmtTime(s.start_at)} → ${fmtTime(s.end_at)}，
+      拟用峰温 ${s.peak_temp} °C · 保温 ${s.hold_minutes} 分钟；
+      提交前安排若有变动会被拒绝并提示刷新。</div>
+    <div class="result-form">
+      <label>实际峰温 °C <input id="ar-peak-${schedId}" type="number" step="1" style="width:80px" /></label>
+      <label>实际保温 分钟 <input id="ar-hold-${schedId}" type="number" step="1" style="width:70px" /></label>
+      <button data-submit-result="${schedId}">提交实绩</button>
+      <button data-cancel-result class="secondary">取消</button>
+    </div>`;
+  detail.classList.remove("hidden");
+  detail.querySelector("[data-submit-result]")
+    .addEventListener("click", () => submitResult(schedId));
+  detail.querySelector("[data-cancel-result]")
+    .addEventListener("click", () => closeSchedDetail(detail));
+}
+
+async function submitResult(schedId) {
+  const s = state.schedules.find((x) => x.id === schedId);
+  if (!s) return;
+  const peakStr = $(`ar-peak-${schedId}`).value.trim();
+  const holdStr = $(`ar-hold-${schedId}`).value.trim();
+  const peak = Number(peakStr);
+  const hold = Number(holdStr);
+  if (peakStr === "" || !(peak >= 0)) { toast("实际峰温须为非负数字", "err"); return; }
+  if (holdStr === "" || !Number.isInteger(hold) || hold < 0) {
+    toast("实际保温分钟须为非负整数", "err");
+    return;
+  }
+  try {
+    // 携带页面读取的安排时段与拟用参数：提交前安排有变动则服务器拒绝并提示刷新
+    const r = await api("POST", `/api/schedules/${schedId}/result`, {
+      start_at: s.start_at,
+      end_at: s.end_at,
+      peak_temp: s.peak_temp,
+      hold_minutes: s.hold_minutes,
+      actual_peak: peak,
+      actual_hold: hold,
+    });
+    const over = r.items.filter((i) => !i.peak_ok || !i.hold_ok);
+    toast(
+      over.length
+        ? `实绩已登记，超界批次：${over.map((i) => i.batch_code).join("、")}`
+        : "实绩已登记，全部批次均在工艺区间内",
+      over.length ? "info" : "ok"
+    );
+    await reloadSchedules();
+    toggleResultView(schedId); // 展开逐批判定结果
+  } catch (e) {
+    // 安排已被修改 / 已被抢先登记：以数据库最新状态为准，刷新列表
+    toast(e.message, "err");
+    await reloadSchedules();
+  }
+}
+
+// 在安排卡片旁展开逐批判定结果
+async function toggleResultView(schedId) {
+  const detail = $(`sched-detail-${schedId}`);
+  if (!detail.classList.contains("hidden")) { closeSchedDetail(detail); return; }
+  try {
+    const r = await api("GET", `/api/schedules/${schedId}/result`);
+    const over = r.items.filter((i) => !i.peak_ok || !i.hold_ok);
+    const verdict = (ok) =>
+      ok ? `<span class="tag tag-open">在界内</span>` : `<span class="tag tag-used">超界</span>`;
+    detail.innerHTML = `
+      <div class="meta">登记于 ${new Date(r.registered_at).toLocaleString()}</div>
+      <div class="meta">拟用：峰温 ${r.peak_temp} °C · 保温 ${r.hold_minutes} 分钟<br>
+        实测：峰温 <b>${r.actual_peak}</b> °C · 保温 <b>${r.actual_hold}</b> 分钟</div>
+      <table>
+        <thead><tr><th>窑位</th><th>批次</th><th>峰温区间(°C)</th><th>峰温判定</th><th>保温区间(min)</th><th>保温判定</th></tr></thead>
+        <tbody>${r.items
+          .map(
+            (i) => `<tr class="${i.peak_ok && i.hold_ok ? "" : "over"}">
+            <td>${i.pos_no}</td><td>${esc(i.batch_code)}</td>
+            <td>${i.peak_min} ~ ${i.peak_max}</td><td>${verdict(i.peak_ok)}</td>
+            <td>${i.hold_min} ~ ${i.hold_max}</td><td>${verdict(i.hold_ok)}</td>
+          </tr>`
+          )
+          .join("")}</tbody>
+      </table>
+      <div class="meta">${over.length
+        ? `超界项目：${over.map((i) => esc(i.batch_code)).join("、")}`
+        : "全部批次均在工艺区间内"}（判定以确认清单快照为准，批次后续修改不改变判定）</div>`;
+    detail.classList.remove("hidden");
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
 
 // ---------------- 启动 ----------------
 
