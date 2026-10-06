@@ -99,3 +99,28 @@ CREATE TABLE IF NOT EXISTS firing_schedules (
     updated_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     CHECK (start_at < end_at)
 );
+
+-- 烧成实绩：为已有烧成安排登记一次实测峰温与保温分钟。
+-- UNIQUE(schedule_id)/UNIQUE(load_id)：每个安排（窑次）只能登记一次，
+--   并发登记时由唯一约束兜底，只有一个事务能提交；
+-- schedule_*：登记时页面读到的安排时段与拟用参数快照，服务端在
+--   BEGIN IMMEDIATE 事务内与 firing_schedules 最新行比对，不一致即
+--   拒绝（stale），提示刷新且不生成实绩；
+-- actual_peak_temp：非负数字，actual_hold_minutes：非负整数分钟；
+--   超出工艺区间的实测值仍如实保存，逐批判定在查询时按
+--   confirmed_load_items 的不可变闭区间快照现算（批次范围后改不影响判定）；
+-- 登记成功后 firing_schedules 对应行不得再修改（由 PUT 路由检查本表）。
+CREATE TABLE IF NOT EXISTS firing_records (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id            INTEGER NOT NULL UNIQUE REFERENCES firing_schedules(id),
+    load_id                INTEGER NOT NULL UNIQUE REFERENCES confirmed_loads(id),
+    schedule_start_at      TEXT NOT NULL,
+    schedule_end_at        TEXT NOT NULL,
+    schedule_peak_temp     REAL NOT NULL,
+    schedule_hold_minutes  INTEGER NOT NULL,
+    actual_peak_temp       REAL NOT NULL,
+    actual_hold_minutes    INTEGER NOT NULL,
+    registered_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    CHECK (actual_peak_temp >= 0),
+    CHECK (actual_hold_minutes >= 0)
+);

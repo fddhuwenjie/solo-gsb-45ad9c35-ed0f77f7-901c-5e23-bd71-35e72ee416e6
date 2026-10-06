@@ -9,7 +9,7 @@
 <body>
   <header>
     <h1>陶瓷合窑装载确认台</h1>
-    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变 · 烧成时段安排</div>
+    <div class="sub">登记待烧批次 · 装窑草案预览 · 版本校验后确认 · 已确认清单不可变 · 烧成时段安排 · 烧成实绩登记</div>
   </header>
 
   <div id="toast" class="toast hidden"></div>
@@ -120,7 +120,35 @@
         同一台窑的时段不得重叠（首尾相接允许，不同窑可同时烧成）。
         拟用峰温/保温须落在该窑次<strong>确认时</strong>的共同区间内。
       </p>
+      <p class="hint">
+        已登记实绩的安排显示“已登记实绩”标记，可在安排旁查看逐批结果，且<strong>不得再修改</strong>。
+      </p>
       <div id="sched-list"></div>
+    </section>
+
+    <!-- 右列：烧成实绩登记 -->
+    <section class="card">
+      <h2>⑤ 烧成实绩登记</h2>
+      <form id="rec-form" class="row-form">
+        <label>安排
+          <select id="r-sched"></select>
+        </label>
+        <label>实际峰温 °C
+          <input id="r-peak" type="number" step="any" min="0" required style="width:90px" />
+        </label>
+        <label>实际保温 分钟
+          <input id="r-hold" type="number" step="1" min="0" required style="width:80px" />
+        </label>
+        <button type="submit" id="r-save" class="confirm">登记实绩</button>
+      </form>
+      <div id="r-sched-info" class="preview" style="display:none"></div>
+      <p class="hint">
+        选择安排后显示页面当前读到的<strong>安排时段与拟用参数</strong>，提交时一并携带；
+        若期间该安排被修改，服务器将拒绝并提示刷新，<strong>不生成实绩</strong>。
+        实际峰温须为非负数字，保温时间须为非负整数分钟；超出工艺区间的实测值仍如实保存，
+        系统按该窑次确认清单中每批的峰温、保温闭区间逐一判定并标出超界项。
+        每个安排只能登记一次，成功后安排不得修改。
+      </p>
     </section>
   </main>
 

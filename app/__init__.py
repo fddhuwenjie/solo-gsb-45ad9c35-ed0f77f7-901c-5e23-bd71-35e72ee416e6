@@ -12,6 +12,12 @@
   保存时在 BEGIN IMMEDIATE 事务内按数据库最新安排重查——同一台窑的
   时间段不得重叠（首尾相接允许），冲突指出占用窑次，失败则原安排不变，
   同窑并发争用同一时段只有一个事务能提交。
+- 烧成实绩登记：为已有安排登记一次实测峰温（非负数字）与保温分钟（非负
+  整数）；登记必须携带页面读到的安排时段与拟用参数，提交时在
+  BEGIN IMMEDIATE 事务内与安排最新行比对，安排有变动则拒绝并提示刷新；
+  每个安排只能登记一次（UNIQUE 兜底），登记成功后安排冻结不得再修改；
+  逐批峰温/保温闭区间判定按确认清单 confirmed_load_items 的不可变快照
+  现算，超界如实保存并标出，批次范围后改不改变判定。
 """
 import numbers
 import sqlite3
@@ -719,10 +725,11 @@ def create_app():
     SCHEDULE_SELECT = """
         SELECT fs.id, fs.load_id, cl.name AS load_name, fs.kiln_id, k.code AS kiln_code,
                fs.start_at, fs.end_at, fs.peak_temp, fs.hold_minutes,
-               fs.created_at, fs.updated_at
+               fs.created_at, fs.updated_at, fr.id AS record_id
           FROM firing_schedules fs
           JOIN confirmed_loads cl ON cl.id = fs.load_id
           JOIN kilns k ON k.id = fs.kiln_id
+          LEFT JOIN firing_records fr ON fr.schedule_id = fs.id
     """
 
     def parse_iso_tz(value, name):
@@ -909,6 +916,18 @@ def create_app():
             if sched is None:
                 db.rollback()
                 return err(404, "烧成安排不存在")
+            locked = db.execute(
+                "SELECT id FROM firing_records WHERE schedule_id = ?", (schedule_id,)
+            ).fetchone()
+            if locked:
+                db.rollback()
+                return err(
+                    409,
+                    f"安排 #{schedule_id} 已登记烧成实绩（实绩 #{locked['id']}），"
+                    "成功登记后安排不得修改",
+                    locked=True,
+                    record_id=locked["id"],
+                )
             load = db.execute(
                 "SELECT * FROM confirmed_loads WHERE id = ?", (sched["load_id"],)
             ).fetchone()
@@ -934,5 +953,200 @@ def create_app():
             db.rollback()
             return err(409, "保存失败：时间须先后有序，原安排保持不变", conflict=True)
         return schedule_detail(db, schedule_id)
+
+    # ------------------------------------------------------------------
+    # 烧成实绩登记（每个安排一次；提交时重查安排快照；逐批按确认快照判定）
+    # ------------------------------------------------------------------
+
+    RECORD_SELECT = """
+        SELECT fr.*, cl.name AS load_name, k.code AS kiln_code
+          FROM firing_records fr
+          JOIN firing_schedules fs ON fs.id = fr.schedule_id
+          JOIN confirmed_loads cl ON cl.id = fr.load_id
+          JOIN kilns k ON k.id = fs.kiln_id
+    """
+
+    def parse_actual_fields(data):
+        """解析实测值：actual_peak_temp 非负数字，actual_hold_minutes 非负整数。"""
+        peak = data.get("actual_peak_temp")
+        hold = data.get("actual_hold_minutes")
+        if isinstance(peak, bool) or not isinstance(peak, numbers.Real):
+            return None, "实际峰温必须是非负数字"
+        if isinstance(hold, bool) or not isinstance(hold, int):
+            return None, "保温时间必须是非负整数分钟"
+        if peak < 0 or hold < 0:
+            return None, "实际峰温与保温时间不能为负数"
+        return (peak, hold), None
+
+    def parse_schedule_snapshot(data):
+        """登记时携带的安排时段与拟用参数（页面读到的值），统一归一为 UTC。"""
+        start, e = parse_iso_tz(data.get("schedule_start_at"), "安排开始时间")
+        if e:
+            return None, e
+        end, e = parse_iso_tz(data.get("schedule_end_at"), "安排结束时间")
+        if e:
+            return None, e
+        peak = data.get("schedule_peak_temp")
+        hold = data.get("schedule_hold_minutes")
+        if isinstance(peak, bool) or not isinstance(peak, numbers.Real):
+            return None, "缺少安排拟用峰温 schedule_peak_temp（数字）"
+        if isinstance(hold, bool) or not isinstance(hold, int):
+            return None, "缺少安排拟用保温 schedule_hold_minutes（整数）"
+        return (start, end, peak, hold), None
+
+    def build_record_body(db, rec):
+        """实绩详情：逐批按 confirmed_load_items 闭区间快照判定，标出超界项。"""
+        items = db.execute(
+            """SELECT batch_id, batch_code, pos_no, peak_min, peak_max,
+                      hold_min, hold_max
+                 FROM confirmed_load_items
+                WHERE load_id = ? ORDER BY pos_no""",
+            (rec["load_id"],),
+        ).fetchall()
+        actual_peak = rec["actual_peak_temp"]
+        actual_hold = rec["actual_hold_minutes"]
+        results = []
+        any_out = False
+        for it in items:
+            peak_out = not (it["peak_min"] <= actual_peak <= it["peak_max"])
+            hold_out = not (it["hold_min"] <= actual_hold <= it["hold_max"])
+            any_out = any_out or peak_out or hold_out
+            results.append(
+                {
+                    "batch_id": it["batch_id"],
+                    "batch_code": it["batch_code"],
+                    "pos_no": it["pos_no"],
+                    "peak_min": it["peak_min"],
+                    "peak_max": it["peak_max"],
+                    "hold_min": it["hold_min"],
+                    "hold_max": it["hold_max"],
+                    "actual_peak_temp": actual_peak,
+                    "actual_hold_minutes": actual_hold,
+                    "peak_out_of_range": peak_out,
+                    "hold_out_of_range": hold_out,
+                    "in_range": not (peak_out or hold_out),
+                }
+            )
+        body = dict(rec)
+        body["items"] = results
+        body["all_in_range"] = not any_out
+        body["out_of_range_count"] = sum(
+            (1 if r["peak_out_of_range"] else 0)
+            + (1 if r["hold_out_of_range"] else 0)
+            for r in results
+        )
+        return body
+
+    @app.route("/api/firing-records", methods=["GET"])
+    def list_firing_records():
+        """全部已登记实绩（按登记时间排序）。"""
+        db = get_db()
+        rows = db.execute(RECORD_SELECT + " ORDER BY fr.id").fetchall()
+        return jsonify([dict(r) for r in rows])
+
+    @app.route("/api/firing-records/<int:record_id>", methods=["GET"])
+    def get_firing_record(record_id):
+        db = get_db()
+        rec = db.execute(
+            RECORD_SELECT + " WHERE fr.id = ?", (record_id,)
+        ).fetchone()
+        if rec is None:
+            return err(404, "烧成实绩不存在")
+        return jsonify(build_record_body(db, rec))
+
+    @app.route("/api/schedules/<int:schedule_id>/firing-record", methods=["POST"])
+    def register_firing_record(schedule_id):
+        """为已有安排登记实绩；安排变动则拒绝（stale），失败不留任何记录。"""
+        data = json_body()
+        actual, e = parse_actual_fields(data)
+        if e:
+            return err(400, e)
+        snap, e = parse_schedule_snapshot(data)
+        if e:
+            return err(400, e)
+        actual_peak, actual_hold = actual
+        s_start, s_end, s_peak, s_hold = snap
+
+        db = get_db()
+        try:
+            # BEGIN IMMEDIATE：并发登记 / 登记与排程修改交错时在此排队，
+            # 以数据库最新状态裁决，重查与写入原子完成。
+            db.execute("BEGIN IMMEDIATE")
+
+            sched = db.execute(
+                "SELECT * FROM firing_schedules WHERE id = ?", (schedule_id,)
+            ).fetchone()
+            if sched is None:
+                db.rollback()
+                return err(404, "烧成安排不存在")
+
+            existing = db.execute(
+                "SELECT id FROM firing_records WHERE schedule_id = ? OR load_id = ?",
+                (schedule_id, sched["load_id"]),
+            ).fetchone()
+            if existing:
+                db.rollback()
+                return err(
+                    409,
+                    f"安排 #{schedule_id}（窑次 #{sched['load_id']}）已登记过烧成实绩"
+                    f"（实绩 #{existing['id']}），每个安排只能登记一次",
+                    conflict=True,
+                    record_id=existing["id"],
+                )
+
+            # 与数据库最新安排比对：提交前安排有变动就提示刷新，不生成实绩
+            cur_start = fmt_utc(s_start)
+            cur_end = fmt_utc(s_end)
+            changed = (
+                sched["start_at"] != cur_start
+                or sched["end_at"] != cur_end
+                or sched["peak_temp"] != s_peak
+                or sched["hold_minutes"] != s_hold
+            )
+            if changed:
+                db.rollback()
+                return err(
+                    409,
+                    "该安排自页面读取后已被修改（时段或拟用参数变动），请刷新安排后重新登记，本次未生成实绩",
+                    stale=True,
+                    latest={
+                        "start_at": sched["start_at"],
+                        "end_at": sched["end_at"],
+                        "peak_temp": sched["peak_temp"],
+                        "hold_minutes": sched["hold_minutes"],
+                    },
+                )
+
+            cur = db.execute(
+                """INSERT INTO firing_records
+                       (schedule_id, load_id, schedule_start_at, schedule_end_at,
+                        schedule_peak_temp, schedule_hold_minutes,
+                        actual_peak_temp, actual_hold_minutes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    schedule_id,
+                    sched["load_id"],
+                    cur_start,
+                    cur_end,
+                    s_peak,
+                    s_hold,
+                    actual_peak,
+                    actual_hold,
+                ),
+            )
+            db.commit()
+        except sqlite3.IntegrityError:
+            # UNIQUE(schedule_id)/UNIQUE(load_id)/CHECK：并发或非法值的落败方
+            db.rollback()
+            return err(
+                409,
+                "并发冲突：该安排已被另一请求抢先登记实绩，请刷新后查看",
+                conflict=True,
+            )
+
+        rec = db.execute(
+            RECORD_SELECT + " WHERE fr.id = ?", (cur.lastrowid,)
+        ).fetchone()
+        return jsonify(build_record_body(db, rec)), 201
 
     return app

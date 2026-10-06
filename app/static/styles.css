@@ -100,6 +100,16 @@ td button { padding: 3px 8px; font-size: 12px; background: #a85a43; }
 .sched-item .meta { font-size: 12px; color: #75695a; margin-top: 2px; }
 .sched-item button { margin-top: 6px; padding: 3px 10px; font-size: 12px; background: #2f6d8f; }
 .sched-item.editing { border-color: #2f6d8f; background: #eef4f8; }
+.sched-item.locked { border-color: #9cc7a8; background: #f1f6f2; }
+
+.tag-record { background: #e2efe4; color: #2e7d4f; margin-left: 6px; }
+.sched-item .rec-btn { background: #2e7d4f; }
+.rec-detail { margin-top: 8px; }
+.rec-table th, .rec-table td { white-space: nowrap; }
+.rec-table td.out { color: #c0392b; font-weight: bold; background: #f9e9e4; }
+.rec-table td.ok-cell { color: #2e7d4f; }
+.rec-ok { color: #2e7d4f; font-weight: bold; }
+.rec-bad { color: #c0392b; font-weight: bold; }
 
 .toast {
   position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
